@@ -46,7 +46,7 @@ class OpenRouterBackend(
         model: String?,
         onDelta: (Delta) -> Unit,
     ): Turn.Assistant {
-        val body = requestBody(system, turns, model ?: this.model)
+        val body = requestBody(system, turns, resolveModel(model))
             .put("tools", JSONArray().apply { tools.forEach { put(it.toJson()) } })
             // "auto", not "required": a model forced to call something on every turn has
             // nothing to call once it has finished, and re-reads the screen instead of
@@ -63,7 +63,7 @@ class OpenRouterBackend(
 
         Log.i(
             TAG,
-            "turn model=${model ?: this.model} id=${reply.generationId} " +
+            "turn model=${body.getString("model")} id=${reply.generationId} " +
                 "finish=${reply.finishReason} calls=${reply.calls.size} " +
                 "text=${reply.text?.length ?: 0} tokens=${reply.usage?.total ?: 0}",
         )
@@ -72,7 +72,7 @@ class OpenRouterBackend(
 
     override suspend fun complete(system: String, prompt: String): String {
         val body = JSONObject()
-            .put("model", fastModel.ifBlank { model })
+            .put("model", resolveModel(fastModel))
             .put(
                 "messages",
                 JSONArray()
@@ -91,6 +91,15 @@ class OpenRouterBackend(
         }
     }
 
+
+    /** Only configuration and the router may choose a model, never response metadata or text. */
+    private fun resolveModel(override: String?): String {
+        val selected = override?.trim()?.takeIf { it.isNotEmpty() } ?: model.trim()
+        if (selected.isEmpty() || selected.any { it.isWhitespace() || it.isISOControl() }) {
+            throw LlmException("Invalid configured model ID: expected a single model identifier without whitespace. Check the main and cheap model settings.")
+        }
+        return selected
+    }
 
     private fun requestBody(system: String, turns: List<Turn>, model: String): JSONObject {
         val messages = JSONArray().put(
@@ -175,7 +184,12 @@ class OpenRouterBackend(
                         if (it.code in RETRYABLE_CODES) {
                             throw Retryable(message, null, it.header("Retry-After")?.toRetryMs())
                         }
-                        throw LlmException("The provider rejected the request. $message")
+                        // Identify what we actually sent, independently of model names quoted
+                        // inside a provider error. Do not log messages, images or credentials.
+                        val requestId = it.header("X-Request-Id")?.take(200)
+                        val context = "host=${request.url.host} model=${JSONObject.quote(body.getString("model"))}" +
+                            (requestId?.let { id -> " request_id=${JSONObject.quote(id)}" } ?: "")
+                        throw LlmException("The provider rejected the request ($context). $message")
                     }
                     read(it)
                 }
@@ -444,7 +458,18 @@ class OpenRouterBackend(
     }
 
     private fun Turn.Assistant.rebuildAssistant(): JSONObject =
-        JSONObject().put("role", "assistant").put("content", text ?: "")
+        JSONObject().put("role", "assistant").put("content", text ?: "").apply {
+            // Restored/imported turns may have no provider echo. The tool results still
+            // require the original call IDs and arguments in the preceding assistant turn.
+            if (calls.isNotEmpty()) put("tool_calls", JSONArray().apply {
+                calls.forEach { call ->
+                    put(JSONObject().put("id", call.id).put("type", "function").put(
+                        "function", JSONObject().put("name", call.name)
+                            .put("arguments", JSONObject(call.input).toString()),
+                    ))
+                }
+            })
+        }
 
     /**
      * A `tool` message may only carry a string. When a tool produced a screenshot, the text

@@ -42,6 +42,8 @@ android {
 
     buildTypes {
         debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
             isMinifyEnabled = false
         }
         release {
@@ -115,4 +117,6 @@ dependencies {
     implementation(libs.luaj)
     debugImplementation(libs.androidx.ui.tooling)
     testImplementation(kotlin("test"))
+    testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

@@ -1,0 +1,83 @@
+name: Debug APK
+
+on:
+  push:
+    branches: ['codex-android-agent-fix']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Run unit tests and build Debug APK
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - name: Verify package and signature, prepare download
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path=app/build/outputs/apk/debug/app-debug.apk
+          sdk_build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          mkdir -p dist
+          "$sdk_build_tools/aapt" dump badging "$apk_path" > dist/apk-info.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          info = Path('dist/apk-info.txt').read_text()
+          match = re.search(r"package: name='([^']+)'", info)
+          assert match and match.group(1) == 'com.foxislam.androidagent.debug', info
+          PY
+          "$sdk_build_tools/apksigner" verify --verbose --print-certs "$apk_path" > dist/signing-certificate.txt
+          "$sdk_build_tools/zipalign" -c -P 16 4 "$apk_path"
+          cp "$apk_path" dist/android-agent-openrouter-debug.apk
+          cp docs/debug-apk.md dist/README.md
+          printf 'commit=%s\nrun=%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > dist/build-info.txt
+          (cd dist && sha256sum android-agent-openrouter-debug.apk > SHA256SUMS)
+          cat dist/signing-certificate.txt >> "$GITHUB_STEP_SUMMARY"
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Download on Android
+          Download **android-agent-debug** from this run's **Artifacts** section while signed in to GitHub, unzip it, and open the APK. If Artifacts are hidden on mobile, enable the browser's Desktop site mode.
+
+          Package: `com.foxislam.androidagent.debug`. This installs beside the Release app. Configure the endpoint, model and API key locally; enable the Debug app's accessibility service separately.
+
+          Each fresh runner generates a Debug signing key. Different runs may have different certificates, so upgrading an earlier Debug install is not guaranteed. Signing private keys and API credentials are not uploaded.
+          SUMMARY
+      - name: Upload Debug APK and public verification metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-agent-debug-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            dist/android-agent-openrouter-debug.apk
+            dist/SHA256SUMS
+            dist/apk-info.txt
+            dist/signing-certificate.txt
+            dist/build-info.txt
+            dist/README.md
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/TEST-*.xml
+          if-no-files-found: ignore
+          retention-days: 14
